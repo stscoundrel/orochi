@@ -18,3 +18,14 @@ jobs:
       - run: go test -race -cover ./...
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - run: ./scripts/package.sh
+      - run: terraform -chdir=infra fmt -check
+      - run: terraform -chdir=infra init -backend=false -input=false -lockfile=readonly
+      - run: terraform -chdir=infra validate
