@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>Fixture</title><item>
+<guid isPermaLink="false">opaque%2bID</guid>
+<link>https://example.test/calendar?id=opaque%2bID&amp;lang=fi</link>
+<title>Title fallback</title>
+<description>&lt;b&gt;Not used&lt;/b&gt;</description>
+<event>
+<uniqueid> 112615111274 </uniqueid><name> Shooting &amp; practice </name>
+<city> Helsinki </city><location>Heslinki, Santahamina</location><specialfield>Ammunta</specialfield>
+<status>Julkaistu</status>
+<startdate>la, 21 marrask. 2026 09.00.00 +0200</startdate>
+<enddate>la, 21 marrask. 2026 12.00.00 +0200</enddate>
+<startdatelocal>2026-11-21T09:00:00Z</startdatelocal>
+<ilmolink><link> </link></ilmolink>
+</event></item></channel></rss>
