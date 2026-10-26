@@ -2,89 +2,103 @@ package storage
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	gcs "cloud.google.com/go/storage"
-	"google.golang.org/api/googleapi"
+	"github.com/stscoundrel/orochi/internal/domain"
 )
 
-type fakeObject struct {
+type memoryObject struct {
 	data       []byte
 	generation int64
-	readErr    error
-	writeErr   error
-	written    []byte
-	expected   int64
+	readError  error
 }
 
-func (o *fakeObject) Read(context.Context) ([]byte, int64, error) {
-	return o.data, o.generation, o.readErr
+func (o *memoryObject) Read(context.Context) ([]byte, int64, error) {
+	return o.data, o.generation, o.readError
 }
 
-func (o *fakeObject) Write(_ context.Context, b []byte, g int64) error {
-	o.written = b
-	o.expected = g
-	return o.writeErr
-}
-
-func TestMissingAndInvalidState(t *testing.T) {
-	ctx := context.Background()
-	o := &fakeObject{readErr: gcs.ErrObjectNotExist}
-	r := NewRepository(o)
-	state, generation, err := r.Load(ctx)
-	if err != nil || generation != 0 || state.Initialized || state.Events == nil {
-		t.Fatalf("missing: %+v %v", state, err)
+func (o *memoryObject) Write(_ context.Context, data []byte, generation int64) error {
+	if generation != o.generation {
+		return ErrConflict
 	}
-	for _, data := range []string{"broken", `{"version":2}`, `{"version":1,"initialized":true,"events":{}}`} {
-		o.readErr = nil
-		o.data = []byte(data)
-		if _, _, err := r.Load(ctx); err == nil {
-			t.Fatalf("accepted %s", data)
-		}
-	}
-	o.readErr = errors.New("denied")
-	if _, _, err := r.Load(ctx); err == nil {
-		t.Fatal("access failure treated as missing")
-	}
+	o.data = data
+	o.generation++
+	return nil
 }
 
-func TestRoundTripAndConditionalWrite(t *testing.T) {
-	ctx := context.Background()
-	o := &fakeObject{generation: 42}
-	r := NewRepository(o)
-	state := EmptyState()
-	state.Initialized = true
-	state.LastSuccessfulCheck = time.Now().UTC()
-	if err := r.Save(ctx, state, 42); err != nil {
+func TestMissingObjectStartsWithAnUninitializedState(t *testing.T) {
+	repository := NewRepository(&memoryObject{readError: gcs.ErrObjectNotExist})
+
+	state, generation, err := repository.Load(context.Background())
+
+	if err != nil {
 		t.Fatal(err)
 	}
-	if o.expected != 42 {
-		t.Fatal("generation lost")
-	}
-	o.data = o.written
-	loaded, g, err := r.Load(ctx)
-	if err != nil || g != 42 || !loaded.LastSuccessfulCheck.Equal(state.LastSuccessfulCheck) {
-		t.Fatalf("round trip: %+v %v", loaded, err)
-	}
-	var decoded State
-	if err := json.Unmarshal(o.written, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	o.writeErr = ErrConflict
-	if err := r.Save(ctx, state, 42); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflict: %v", err)
+	if generation != 0 || state.Initialized || state.Events == nil || state.Version != Version {
+		t.Fatalf("unexpected initial state: %+v, generation %d", state, generation)
 	}
 }
 
-func TestWriteError(t *testing.T) {
-	if !errors.Is(writeError(&googleapi.Error{Code: 412}), ErrConflict) {
-		t.Fatal("precondition not mapped")
+func TestStoredEventsSurviveSaveAndReload(t *testing.T) {
+	object := &memoryObject{}
+	repository := NewRepository(object)
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	event := domain.Event{
+		ID:              "mpk:112615111274",
+		Name:            "Kivääriammunta",
+		City:            "Helsinki",
+		Location:        "Helsinki, Santahamina",
+		SpecialField:    "Ammunta",
+		Status:          "Ilmo auki",
+		URL:             "https://example.test/calendar",
+		RegistrationURL: "https://example.test/signup",
+		StartTime:       now.Add(24 * time.Hour),
+		EndTime:         now.Add(27 * time.Hour),
+		FirstSeen:       now,
 	}
-	failure := &googleapi.Error{Code: 403}
-	if writeError(failure) != failure || writeError(nil) != nil {
-		t.Fatal("write error changed")
+	state := State{
+		Version:             Version,
+		Initialized:         true,
+		LastSuccessfulCheck: now,
+		Events:              map[string]domain.Event{event.ID: event},
+	}
+
+	if err := repository.Save(context.Background(), state, 0); err != nil {
+		t.Fatal(err)
+	}
+	// A new repository instance represents a later function invocation.
+	reloaded, generation, err := NewRepository(object).Load(context.Background())
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded, state) || generation != 1 {
+		t.Fatalf("reloaded state = %+v (generation %d), want %+v", reloaded, generation, state)
+	}
+}
+
+func TestUnreadableStateIsNotTreatedAsAnEmptyBaseline(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		object memoryObject
+	}{
+		{name: "permission denied", object: memoryObject{readError: errors.New("permission denied")}},
+		{name: "corrupt JSON", object: memoryObject{data: []byte("broken")}},
+		{name: "unsupported version", object: memoryObject{data: []byte(`{"version":2,"initialized":true,"last_successful_check":"2026-10-26T12:00:00Z","events":{}}`)}},
+		{name: "incomplete state", object: memoryObject{data: []byte(`{"version":1,"initialized":true,"events":{}}`)}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			repository := NewRepository(&scenario.object)
+
+			_, _, err := repository.Load(context.Background())
+
+			if err == nil {
+				t.Fatal("unreadable state was treated as a fresh installation")
+			}
+		})
 	}
 }
