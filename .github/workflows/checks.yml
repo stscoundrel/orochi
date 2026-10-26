@@ -1,7 +1,5 @@
-name: Checks
-on:
-  push:
-  pull_request:
+name: Go and Terraform validation
+on: [pull_request]
 permissions:
   contents: read
 jobs:
