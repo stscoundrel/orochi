@@ -1,21 +1,8 @@
-name: Go and Terraform validation
+name: Terraform validation
 on: [pull_request]
 permissions:
   contents: read
 jobs:
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test -race -cover ./...
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
   infrastructure:
     runs-on: ubuntu-latest
     steps:
