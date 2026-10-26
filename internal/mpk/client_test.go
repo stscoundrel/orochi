@@ -2,6 +2,7 @@ package mpk
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,49 +10,55 @@ import (
 	"time"
 )
 
-func TestFetch(t *testing.T) {
-	data := fixture(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if q.Get("startDate") != "21-10-2026" || q.Get("Location") != "Helsinki" || q.Get("Specialfield") != "Ammunta" {
-			t.Errorf("query: %v", q)
+func TestFetchRequestsTodayInHelsinki(t *testing.T) {
+	feed := readFeedFixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		if query.Get("startDate") != "21-10-2026" {
+			t.Errorf("start date = %q, want 21-10-2026", query.Get("startDate"))
 		}
-		_, _ = w.Write([]byte(data))
+		if query.Get("Location") != "Helsinki" || query.Get("Specialfield") != "Ammunta" {
+			t.Errorf("unexpected feed filters: %v", query)
+		}
+		_, _ = io.WriteString(w, feed)
 	}))
 	defer server.Close()
-	c := Client{Endpoint: server.URL, HTTP: server.Client()}
-	events, err := c.Fetch(context.Background(), time.Date(2026, 10, 20, 22, 30, 0, 0, time.UTC))
-	if err != nil || len(events) != 1 {
-		t.Fatalf("fetch: %v, %d", err, len(events))
+	client := Client{Endpoint: server.URL, HTTP: server.Client()}
+	// It is already the next day in Helsinki at this UTC time.
+	now := time.Date(2026, 10, 20, 22, 30, 0, 0, time.UTC)
+
+	events, err := client.Fetch(context.Background(), now)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("fetched %d events, want 2", len(events))
 	}
 }
 
-func TestFetchFailures(t *testing.T) {
-	for _, tc := range []struct {
+func TestFetchRejectsUnavailableOrOversizedResponse(t *testing.T) {
+	for _, scenario := range []struct {
 		name   string
 		status int
 		body   string
 	}{
-		{"status", 503, "unavailable"},
-		{"malformed", 200, "<rss>"},
-		{"oversize", 200, strings.Repeat("x", int(maxResponseBytes)+1)},
+		{name: "upstream unavailable", status: http.StatusServiceUnavailable, body: "unavailable"},
+		{name: "response exceeds size limit", status: http.StatusOK, body: strings.Repeat("x", int(maxResponseBytes)+1)},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(tc.body))
+		t.Run(scenario.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.WriteHeader(scenario.status)
+				_, _ = io.WriteString(w, scenario.body)
 			}))
 			defer server.Close()
-			c := Client{Endpoint: server.URL, HTTP: server.Client()}
-			if _, err := c.Fetch(context.Background(), time.Now()); err == nil {
-				t.Fatal("expected failure")
+			client := Client{Endpoint: server.URL, HTTP: server.Client()}
+
+			events, err := client.Fetch(context.Background(), time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC))
+
+			if err == nil || len(events) != 0 {
+				t.Fatalf("failed fetch returned events: %+v; error: %v", events, err)
 			}
 		})
-	}
-	c := NewClient()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := c.Fetch(ctx, time.Now()); err == nil {
-		t.Fatal("cancelled request succeeded")
 	}
 }

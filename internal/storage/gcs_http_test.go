@@ -10,48 +10,51 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	gcs "cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
-// Exercise the real SDK against a local server, including errors surfaced only
-// when the upload writer closes. No cloud credentials or services are used.
-func TestSDKConditionalWrites(t *testing.T) {
-	for _, tc := range []struct {
+// Use the real SDK against a local server. This catches conditional-write and
+// writer.Close failures that an in-memory repository cannot exercise.
+func TestUploadProtectsExistingStateAndReportsFailures(t *testing.T) {
+	data := []byte(`{"version":1}`)
+	// Successful GCS upload responses include the checksum verified by the SDK.
+	var checksum [4]byte
+	binary.BigEndian.PutUint32(checksum[:], crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli)))
+	metadata := fmt.Sprintf(`{"name":"events.json","bucket":"bucket","generation":"43","crc32c":"%s"}`,
+		base64.StdEncoding.EncodeToString(checksum[:]))
+
+	for _, scenario := range []struct {
 		name       string
 		generation int64
 		status     int
-		conflict   bool
 	}{
-		{"create", 0, 200, false},
-		{"update", 42, 200, false},
-		{"conflict", 42, 412, true},
-		{"close failure", 42, 403, false},
+		{name: "create only if absent", generation: 0, status: http.StatusOK},
+		{name: "update only the version we read", generation: 42, status: http.StatusOK},
+		{name: "another writer changed the object", generation: 42, status: http.StatusPreconditionFailed},
+		{name: "upload denied when writer closes", generation: 42, status: http.StatusForbidden},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var called bool
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Run(scenario.name, func(t *testing.T) {
+			called := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				called = true
-				want := "42"
-				if tc.generation == 0 {
-					want = "0"
+				expectedGeneration := strconv.FormatInt(scenario.generation, 10)
+				if generation := request.URL.Query().Get("ifGenerationMatch"); generation != expectedGeneration {
+					t.Errorf("upload precondition = %q, want %q", generation, expectedGeneration)
 				}
-				if got := r.URL.Query().Get("ifGenerationMatch"); got != want {
-					t.Errorf("precondition=%q want %q", got, want)
-				}
-				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				if _, err := io.Copy(io.Discard, request.Body); err != nil {
 					t.Error(err)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(tc.status)
-				if tc.status == 200 {
-					var checksum [4]byte
-					binary.BigEndian.PutUint32(checksum[:], crc32.Checksum([]byte(`{"version":1}`), crc32.MakeTable(crc32.Castagnoli)))
-					_, _ = fmt.Fprintf(w, `{"name":"events.json","bucket":"bucket","generation":"43","crc32c":"%s"}`, base64.StdEncoding.EncodeToString(checksum[:]))
+				w.WriteHeader(scenario.status)
+				if scenario.status == http.StatusOK {
+					_, _ = io.WriteString(w, metadata)
 				} else {
-					_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"test failure"}}`, tc.status)
+					_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"upload failed"}}`, scenario.status)
 				}
 			}))
 			defer server.Close()
@@ -65,18 +68,26 @@ func TestSDKConditionalWrites(t *testing.T) {
 			}
 			defer client.Close()
 			object := &gcsObject{object: client.Bucket("bucket").Object("events.json")}
-			err = object.Write(context.Background(), []byte(`{"version":1}`), tc.generation)
+
+			err = object.Write(context.Background(), data, scenario.generation)
+
 			if !called {
-				t.Fatal("SDK did not make request")
+				t.Fatal("no upload was attempted")
 			}
-			if tc.status == 200 && err != nil {
-				t.Fatal(err)
-			}
-			if tc.status != 200 && err == nil {
-				t.Fatal("upload failure ignored")
-			}
-			if tc.conflict && !errors.Is(err, ErrConflict) {
-				t.Fatalf("conflict: %v", err)
+			switch scenario.status {
+			case http.StatusOK:
+				if err != nil {
+					t.Fatalf("successful upload failed: %v", err)
+				}
+			case http.StatusPreconditionFailed:
+				if !errors.Is(err, ErrConflict) {
+					t.Fatalf("competing write error = %v, want ErrConflict", err)
+				}
+			case http.StatusForbidden:
+				var apiError *googleapi.Error
+				if !errors.As(err, &apiError) || apiError.Code != http.StatusForbidden {
+					t.Fatalf("upload error = %v, want permission denied", err)
+				}
 			}
 		})
 	}
